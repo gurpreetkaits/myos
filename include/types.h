@@ -1,0 +1,27 @@
+#ifndef TYPES_H
+#define TYPES_H
+
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+typedef char               int8_t;
+typedef short              int16_t;
+typedef int                int32_t;
+typedef unsigned int       size_t;
+
+#define NULL ((void *)0)
+
+/* C23 has bool/true/false as keywords; for older standards, define them */
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L
+typedef _Bool bool;
+#define true  1
+#define false 0
+#endif
+
+/* Variadic argument support (GCC built-in) */
+typedef __builtin_va_list va_list;
+#define va_start(ap, last) __builtin_va_start(ap, last)
+#define va_end(ap)         __builtin_va_end(ap)
+#define va_arg(ap, type)   __builtin_va_arg(ap, type)
+
+#endif
