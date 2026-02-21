@@ -16,6 +16,7 @@
 
 global context_switch
 global task_start_wrapper
+global user_mode_enter
 
 context_switch:
     push ebx
@@ -41,3 +42,19 @@ context_switch:
 task_start_wrapper:
     sti
     ret
+
+; Trampoline for ring 3 process entry.
+; The kernel stack has an IRET frame above us:
+;   [ESP+0]  EIP
+;   [ESP+4]  CS  (0x1B = user code)
+;   [ESP+8]  EFLAGS
+;   [ESP+12] ESP (user stack)
+;   [ESP+16] SS  (0x23 = user data)
+; Load user data segments, then IRET to ring 3.
+user_mode_enter:
+    mov ax, 0x23        ; User data segment (0x20 | RPL 3)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    iret

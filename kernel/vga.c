@@ -2,18 +2,31 @@
 #include "types.h"
 #include "string.h"
 #include "io.h"
+#include "fb.h"
+#include "font.h"
 
 static unsigned short *vga_buffer = (unsigned short *)VGA_MEMORY;
 static int cursor_col = 0;
 static int cursor_row = 0;
 static unsigned char terminal_color = 0x0F;
 
+static int term_cols = VGA_COLS;
+static int term_rows = VGA_ROWS;
+static bool use_fb = false;
+
+static const uint32_t vga_to_rgb[16] = {
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+    0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+    0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+};
+
 static unsigned short vga_entry(char c, unsigned char color) {
     return (unsigned short)c | (unsigned short)color << 8;
 }
 
-/* Update the hardware cursor position */
 static void update_cursor(void) {
+    if (use_fb) return;
     uint16_t pos = cursor_row * VGA_COLS + cursor_col;
     outb(0x3D4, 14);
     outb(0x3D5, (uint8_t)(pos >> 8));
@@ -21,20 +34,40 @@ static void update_cursor(void) {
     outb(0x3D5, (uint8_t)(pos & 0xFF));
 }
 
+static void fb_draw_grid_char(int col, int row, char c, unsigned char color) {
+    uint32_t fg = vga_to_rgb[color & 0x0F];
+    uint32_t bg = vga_to_rgb[(color >> 4) & 0x0F];
+    fb_draw_char(col * 8, row * 16, c, fg, bg);
+}
+
 void terminal_init(void) {
     terminal_color = (VGA_BLACK << 4) | VGA_WHITE;
-    terminal_clear();
 
-    /* Enable cursor (scanline 14-15) */
-    outb(0x3D4, 0x0A);
-    outb(0x3D5, (inb(0x3D5) & 0xC0) | 14);
-    outb(0x3D4, 0x0B);
-    outb(0x3D5, (inb(0x3D5) & 0xE0) | 15);
+    if (fb_is_active()) {
+        use_fb = true;
+        term_cols = fb_get_width() / 8;
+        term_rows = fb_get_height() / 16;
+        fb_clear(0x000000);
+    } else {
+        use_fb = false;
+        term_cols = VGA_COLS;
+        term_rows = VGA_ROWS;
+        outb(0x3D4, 0x0A);
+        outb(0x3D5, (inb(0x3D5) & 0xC0) | 14);
+        outb(0x3D4, 0x0B);
+        outb(0x3D5, (inb(0x3D5) & 0xE0) | 15);
+    }
+
+    terminal_clear();
 }
 
 void terminal_clear(void) {
-    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++) {
-        vga_buffer[i] = vga_entry(' ', terminal_color);
+    if (use_fb) {
+        fb_clear(vga_to_rgb[(terminal_color >> 4) & 0x0F]);
+    } else {
+        for (int i = 0; i < VGA_COLS * VGA_ROWS; i++) {
+            vga_buffer[i] = vga_entry(' ', terminal_color);
+        }
     }
     cursor_col = 0;
     cursor_row = 0;
@@ -46,13 +79,30 @@ void terminal_setcolor(unsigned char fg, unsigned char bg) {
 }
 
 static void terminal_scroll(void) {
-    for (int i = 0; i < (VGA_ROWS - 1) * VGA_COLS; i++) {
-        vga_buffer[i] = vga_buffer[i + VGA_COLS];
+    if (use_fb) {
+        uint32_t *fbuf = fb_get_buffer();
+        uint32_t pitch = fb_get_pitch();
+        uint32_t h = fb_get_height();
+        uint32_t w = fb_get_width();
+        for (uint32_t y = 0; y < h - 16; y++) {
+            uint32_t *dst = (uint32_t *)((uint8_t *)fbuf + y * pitch);
+            uint32_t *src = (uint32_t *)((uint8_t *)fbuf + (y + 16) * pitch);
+            memcpy(dst, src, w * 4);
+        }
+        uint32_t bg = vga_to_rgb[(terminal_color >> 4) & 0x0F];
+        for (uint32_t y = h - 16; y < h; y++) {
+            uint32_t *dst = (uint32_t *)((uint8_t *)fbuf + y * pitch);
+            for (uint32_t x = 0; x < w; x++) dst[x] = bg;
+        }
+    } else {
+        for (int i = 0; i < (VGA_ROWS - 1) * VGA_COLS; i++) {
+            vga_buffer[i] = vga_buffer[i + VGA_COLS];
+        }
+        for (int i = (VGA_ROWS - 1) * VGA_COLS; i < VGA_ROWS * VGA_COLS; i++) {
+            vga_buffer[i] = vga_entry(' ', terminal_color);
+        }
     }
-    for (int i = (VGA_ROWS - 1) * VGA_COLS; i < VGA_ROWS * VGA_COLS; i++) {
-        vga_buffer[i] = vga_entry(' ', terminal_color);
-    }
-    cursor_row = VGA_ROWS - 1;
+    cursor_row = term_rows - 1;
 }
 
 void terminal_putchar(char c) {
@@ -65,16 +115,20 @@ void terminal_putchar(char c) {
         terminal_backspace();
         return;
     } else {
-        int offset = cursor_row * VGA_COLS + cursor_col;
-        vga_buffer[offset] = vga_entry(c, terminal_color);
+        if (use_fb) {
+            fb_draw_grid_char(cursor_col, cursor_row, c, terminal_color);
+        } else {
+            int offset = cursor_row * VGA_COLS + cursor_col;
+            vga_buffer[offset] = vga_entry(c, terminal_color);
+        }
         cursor_col++;
     }
 
-    if (cursor_col >= VGA_COLS) {
+    if (cursor_col >= term_cols) {
         cursor_col = 0;
         cursor_row++;
     }
-    if (cursor_row >= VGA_ROWS) {
+    if (cursor_row >= term_rows) {
         terminal_scroll();
     }
     update_cursor();
@@ -105,17 +159,20 @@ void terminal_backspace(void) {
         cursor_col--;
     } else if (cursor_row > 0) {
         cursor_row--;
-        cursor_col = VGA_COLS - 1;
+        cursor_col = term_cols - 1;
     }
-    int offset = cursor_row * VGA_COLS + cursor_col;
-    vga_buffer[offset] = vga_entry(' ', terminal_color);
+    if (use_fb) {
+        fb_draw_grid_char(cursor_col, cursor_row, ' ', terminal_color);
+    } else {
+        int offset = cursor_row * VGA_COLS + cursor_col;
+        vga_buffer[offset] = vga_entry(' ', terminal_color);
+    }
     update_cursor();
 }
 
 int terminal_get_col(void) { return cursor_col; }
 int terminal_get_row(void) { return cursor_row; }
 
-/* Simple printf: supports %s, %d, %x, %c, %% */
 void terminal_printf(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);

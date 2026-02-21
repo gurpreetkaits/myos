@@ -2,20 +2,18 @@
 #include "idt.h"
 #include "io.h"
 #include "vga.h"
+#include "event.h"
 
 #define KB_DATA_PORT 0x60
 #define KB_BUFFER_SIZE 128
 
-/* Circular buffer for keypresses */
 static char kb_buffer[KB_BUFFER_SIZE];
 static volatile int kb_head = 0;
 static volatile int kb_tail = 0;
 
-/* Modifier key state */
 static bool shift_held = false;
 static bool caps_lock  = false;
 
-/* Scancode set 1 → ASCII (US QWERTY layout) */
 static const char scancode_to_ascii[128] = {
     0,   27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b',
     '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
@@ -31,7 +29,6 @@ static const char scancode_to_ascii[128] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
-/* Shifted characters */
 static const char scancode_to_ascii_shift[128] = {
     0,   27, '!','@','#','$','%','^','&','*','(',')','_','+', '\b',
     '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',
@@ -59,18 +56,15 @@ static void keyboard_handler(registers_t *regs) {
     (void)regs;
     uint8_t scancode = inb(KB_DATA_PORT);
 
-    /* Key release (bit 7 set) */
     if (scancode & 0x80) {
         uint8_t released = scancode & 0x7F;
-        if (released == 0x2A || released == 0x36) shift_held = false;  /* Shift released */
+        if (released == 0x2A || released == 0x36) shift_held = false;
         return;
     }
 
-    /* Modifier keys */
     if (scancode == 0x2A || scancode == 0x36) { shift_held = true; return; }
-    if (scancode == 0x3A) { caps_lock = !caps_lock; return; }  /* Caps Lock toggle */
+    if (scancode == 0x3A) { caps_lock = !caps_lock; return; }
 
-    /* Translate scancode to ASCII */
     char c;
     if (shift_held) {
         c = scancode_to_ascii_shift[scancode];
@@ -78,12 +72,12 @@ static void keyboard_handler(registers_t *regs) {
         c = scancode_to_ascii[scancode];
     }
 
-    /* Apply caps lock to letters */
     if (caps_lock && c >= 'a' && c <= 'z') c -= 32;
     else if (caps_lock && c >= 'A' && c <= 'Z') c += 32;
 
     if (c != 0) {
         kb_buffer_push(c);
+        event_push_key(c);
     }
 }
 
@@ -104,7 +98,7 @@ char keyboard_read(void) {
 
 char keyboard_getchar(void) {
     while (!keyboard_has_input()) {
-        hlt();  /* Sleep until next interrupt */
+        hlt();
     }
     return keyboard_read();
 }

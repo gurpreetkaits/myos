@@ -2,13 +2,6 @@
 #include "string.h"
 #include "vga.h"
 
-/* ============================================================
- * Physical Memory Manager (Bitmap)
- *
- * Each bit represents a 4KB page.
- * Manages memory from 1MB (0x100000) upward.
- * ============================================================ */
-
 #define PAGE_SIZE       4096
 #define PMM_START       0x100000   /* Start managing from 1MB */
 #define PMM_BITMAP_ADDR 0x20000    /* Bitmap stored at 128KB */
@@ -34,11 +27,10 @@ void pmm_init(uint32_t mem_size_kb) {
     pmm_total_pages = (mem_size_kb * 1024 - PMM_START) / PAGE_SIZE;
     if (pmm_total_pages > PMM_MAX_PAGES) pmm_total_pages = PMM_MAX_PAGES;
 
-    /* Bitmap size: total_pages / 8 bytes */
     uint32_t bitmap_size = pmm_total_pages / 8;
     if (pmm_total_pages % 8) bitmap_size++;
 
-    memset(pmm_bitmap, 0, bitmap_size);  /* All pages free */
+    memset(pmm_bitmap, 0, bitmap_size);
     pmm_used_pages = 0;
 }
 
@@ -50,7 +42,7 @@ void *pmm_alloc_page(void) {
             return (void *)(PMM_START + i * PAGE_SIZE);
         }
     }
-    return NULL;  /* Out of memory */
+    return NULL;
 }
 
 void pmm_free_page(void *addr) {
@@ -71,39 +63,28 @@ uint32_t pmm_get_total_pages(void) {
     return pmm_total_pages;
 }
 
-/* ============================================================
- * Paging
- *
- * Identity-map the first 16MB so virtual == physical.
- * Page directory at 0x30000, page tables follow.
- * ============================================================ */
-
-#define PD_ADDR  0x30000   /* Page directory (4KB aligned) */
-#define PT_ADDR  0x31000   /* Page tables start here */
+#define PD_ADDR  0x30000
+#define PT_ADDR  0x31000
 
 void paging_init(void) {
     uint32_t *page_dir = (uint32_t *)PD_ADDR;
     memset(page_dir, 0, PAGE_SIZE);
 
-    /* Identity map first 16MB (4 page tables, each mapping 4MB) */
     for (int i = 0; i < 4; i++) {
         uint32_t *page_table = (uint32_t *)(PT_ADDR + i * PAGE_SIZE);
 
         for (int j = 0; j < 1024; j++) {
             uint32_t phys_addr = (i * 1024 + j) * PAGE_SIZE;
-            /* Present + Read/Write */
             page_table[j] = phys_addr | 0x03;
         }
 
-        /* Present + Read/Write */
         page_dir[i] = ((uint32_t)page_table) | 0x03;
     }
 
-    /* Load page directory and enable paging */
     __asm__ volatile(
-        "mov %0, %%cr3\n"           /* Load page directory base */
+        "mov %0, %%cr3\n"
         "mov %%cr0, %%eax\n"
-        "or $0x80000000, %%eax\n"   /* Set PG bit */
+        "or $0x80000000, %%eax\n"
         "mov %%eax, %%cr0\n"
         :
         : "r"(PD_ADDR)
@@ -111,18 +92,37 @@ void paging_init(void) {
     );
 }
 
-/* ============================================================
- * Heap Allocator (First-fit linked list)
- *
- * Heap region: 0x200000 - 0x400000 (2MB)
- * Each block has a header: { size, is_free, next }
- * ============================================================ */
+#define EXTRA_PT_BASE 0x35000
+static int next_pt_slot = 0;
+
+void paging_map_region(uint32_t virt, uint32_t phys, uint32_t size, uint32_t flags) {
+    uint32_t *page_dir = (uint32_t *)PD_ADDR;
+
+    for (uint32_t offset = 0; offset < size; offset += PAGE_SIZE) {
+        uint32_t v = virt + offset;
+        uint32_t p = phys + offset;
+        uint32_t pd_index = v >> 22;
+        uint32_t pt_index = (v >> 12) & 0x3FF;
+
+        if (!(page_dir[pd_index] & 0x01)) {
+            uint32_t pt_phys = EXTRA_PT_BASE + next_pt_slot * PAGE_SIZE;
+            next_pt_slot++;
+            memset((void *)pt_phys, 0, PAGE_SIZE);
+            page_dir[pd_index] = pt_phys | flags | 0x01;
+        }
+
+        uint32_t *page_table = (uint32_t *)(page_dir[pd_index] & 0xFFFFF000);
+        page_table[pt_index] = p | flags | 0x01;
+    }
+
+    __asm__ volatile("mov %%cr3, %%eax\nmov %%eax, %%cr3" ::: "eax");
+}
 
 #define HEAP_START 0x200000
-#define HEAP_SIZE  0x200000   /* 2MB */
+#define HEAP_SIZE  0x200000
 
 typedef struct heap_block {
-    uint32_t size;            /* Size of data area (excludes header) */
+    uint32_t size;
     bool is_free;
     struct heap_block *next;
 } heap_block_t;
@@ -141,13 +141,11 @@ void heap_init(void) {
 void *kmalloc(size_t size) {
     if (size == 0) return NULL;
 
-    /* Align to 4 bytes */
     size = (size + 3) & ~3;
 
     heap_block_t *curr = heap_head;
     while (curr) {
         if (curr->is_free && curr->size >= size) {
-            /* Split block if significantly larger */
             if (curr->size > size + sizeof(heap_block_t) + 16) {
                 heap_block_t *new_block = (heap_block_t *)((uint8_t *)curr + sizeof(heap_block_t) + size);
                 new_block->size = curr->size - size - sizeof(heap_block_t);
@@ -162,7 +160,7 @@ void *kmalloc(size_t size) {
         }
         curr = curr->next;
     }
-    return NULL;  /* Out of heap memory */
+    return NULL;
 }
 
 void kfree(void *ptr) {
@@ -172,13 +170,12 @@ void kfree(void *ptr) {
     block->is_free = true;
     heap_used -= block->size;
 
-    /* Coalesce adjacent free blocks */
     heap_block_t *curr = heap_head;
     while (curr) {
         if (curr->is_free && curr->next && curr->next->is_free) {
             curr->size += sizeof(heap_block_t) + curr->next->size;
             curr->next = curr->next->next;
-            continue;  /* Check again in case of triple merge */
+            continue;
         }
         curr = curr->next;
     }

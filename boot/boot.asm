@@ -1,12 +1,14 @@
-; boot.asm - Bootloader
-; Loads kernel using single-sector CHS reads in a loop (most robust).
-; Switches to 32-bit protected mode, jumps to kernel.
+; boot.asm - Bootloader with VESA framebuffer support
+; Loads kernel, sets VESA graphics mode (800x600x32), switches to protected mode.
 
 [bits 16]
 [org 0x7C00]
 
-KERNEL_OFFSET equ 0x1000
-KERNEL_SECTORS equ 48     ; ~24 KB, plenty for our kernel
+KERNEL_OFFSET  equ 0x1000
+KERNEL_SECTORS equ 128       ; ~64 KB for kernel + GUI
+BOOTINFO_ADDR  equ 0x500    ; Boot info struct address
+BOOTINFO_MAGIC equ 0x4F594D42  ; "BMYO"
+VBE_INFO_BUF   equ 0x7E00   ; VBE mode info buffer (512 bytes)
 
 mov [BOOT_DRIVE], dl
 mov bp, 0x9000
@@ -15,6 +17,7 @@ mov sp, bp
 mov si, MSG_BOOT
 call print_16
 call load_kernel
+call setup_vesa
 call switch_to_pm
 jmp $
 
@@ -39,39 +42,38 @@ load_kernel:
     mov si, MSG_LOAD
     call print_16
 
-    ; Use INT 13h extensions (LBA) - most reliable for hard drives
-    ; First check if extensions are supported
+    ; Try LBA first
     mov ah, 0x41
     mov bx, 0x55AA
     mov dl, [BOOT_DRIVE]
     int 0x13
-    jc .no_lba          ; Extensions not supported
+    jc .no_lba
 
-    ; Extensions supported - use LBA read
     mov si, DAP
     mov ah, 0x42
     mov dl, [BOOT_DRIVE]
     int 0x13
-    jnc .load_done      ; Success
+    jnc .load_done
 
 .no_lba:
-    ; Fallback: read one sector at a time using CHS
-    ; Works universally regardless of drive geometry
+    ; Fallback: CHS one sector at a time
     xor ax, ax
     mov es, ax
     mov bx, KERNEL_OFFSET
-    mov cx, KERNEL_SECTORS   ; loop counter
-    mov byte [cur_sect], 2   ; start from CHS sector 2
+    mov cx, KERNEL_SECTORS
+    mov byte [cur_sect], 2
+    mov byte [cur_head], 0
+    mov byte [cur_cyl], 0
 
 .read_loop:
     push cx
     push bx
 
-    mov ah, 0x02         ; BIOS read
-    mov al, 1            ; 1 sector
-    mov ch, 0            ; cylinder 0
-    mov cl, [cur_sect]   ; sector number
-    mov dh, 0            ; head 0
+    mov ah, 0x02
+    mov al, 1
+    mov ch, [cur_cyl]
+    mov cl, [cur_sect]
+    mov dh, [cur_head]
     mov dl, [BOOT_DRIVE]
     int 0x13
     jc disk_error
@@ -79,19 +81,32 @@ load_kernel:
     pop bx
     pop cx
 
-    add bx, 512          ; advance buffer
-    inc byte [cur_sect]  ; next sector
-
-    ; If sector > 63 (max for most drives), wrap to next head
+    add bx, 512
+    jnc .no_seg_bump
+    ; BX wrapped around - advance ES segment
+    mov ax, es
+    add ax, 0x1000
+    mov es, ax
+    xor bx, bx
+.no_seg_bump:
+    inc byte [cur_sect]
     cmp byte [cur_sect], 64
-    jl .no_wrap
+    jl .read_loop
+
+    ; Wrap to next head
     mov byte [cur_sect], 1
-    ; Could advance head/cylinder here, but our kernel fits in <63 sectors
-.no_wrap:
+    inc byte [cur_head]
+    cmp byte [cur_head], 2
+    jl .read_loop
+    mov byte [cur_head], 0
+    inc byte [cur_cyl]
 
     loop .read_loop
 
 .load_done:
+    ; Reset ES to 0
+    xor ax, ax
+    mov es, ax
     mov si, MSG_OK
     call print_16
     ret
@@ -101,33 +116,108 @@ disk_error:
     call print_16
     jmp $
 
-; Disk Address Packet for INT 13h LBA extensions
-DAP:
-    db 0x10              ; Size of packet
-    db 0                 ; Reserved
-    dw KERNEL_SECTORS    ; Sectors to read
-    dw KERNEL_OFFSET     ; Offset
-    dw 0x0000            ; Segment
-    dd 1                 ; LBA start (sector after boot)
-    dd 0                 ; Upper LBA
+; ============================================================
+; VESA Framebuffer Setup
+; ============================================================
 
-cur_sect: db 0
+setup_vesa:
+    ; Try mode 0x115 (800x600x32bpp)
+    mov cx, 0x115
+    call try_vesa_mode
+    jnc .vesa_ok
+
+    ; Fallback: mode 0x112 (640x480x32bpp)
+    mov cx, 0x112
+    call try_vesa_mode
+    jnc .vesa_ok
+
+    ; No VESA - write text mode bootinfo
+    mov dword [BOOTINFO_ADDR], BOOTINFO_MAGIC
+    mov dword [BOOTINFO_ADDR + 4], 0       ; no fb
+    mov dword [BOOTINFO_ADDR + 24], 0      ; vesa_mode = 0
+    ret
+
+.vesa_ok:
+    ret
+
+; Try to set VESA mode in CX. Returns CF=0 on success.
+try_vesa_mode:
+    push cx
+    ; Get mode info into VBE_INFO_BUF
+    mov ax, 0x4F01
+    mov di, VBE_INFO_BUF
+    int 0x10
+    cmp ax, 0x004F
+    jne .fail
+
+    ; Check mode attributes (bit 0 = supported, bit 7 = LFB)
+    test byte [VBE_INFO_BUF], 0x81
+    jz .fail
+
+    ; Set the mode (bit 14 = use LFB)
+    pop cx
+    push cx
+    or cx, 0x4000
+    mov ax, 0x4F02
+    mov bx, cx
+    int 0x10
+    cmp ax, 0x004F
+    jne .fail
+
+    ; Store bootinfo
+    mov dword [BOOTINFO_ADDR], BOOTINFO_MAGIC
+    ; fb_addr = dword at VBE_INFO_BUF+40
+    mov eax, [VBE_INFO_BUF + 40]
+    mov [BOOTINFO_ADDR + 4], eax
+    ; fb_width = word at VBE_INFO_BUF+18
+    movzx eax, word [VBE_INFO_BUF + 18]
+    mov [BOOTINFO_ADDR + 8], eax
+    ; fb_height = word at VBE_INFO_BUF+20
+    movzx eax, word [VBE_INFO_BUF + 20]
+    mov [BOOTINFO_ADDR + 12], eax
+    ; fb_pitch = word at VBE_INFO_BUF+16
+    movzx eax, word [VBE_INFO_BUF + 16]
+    mov [BOOTINFO_ADDR + 16], eax
+    ; fb_bpp = byte at VBE_INFO_BUF+25
+    movzx eax, byte [VBE_INFO_BUF + 25]
+    mov [BOOTINFO_ADDR + 20], eax
+    ; vesa_mode = 1
+    mov dword [BOOTINFO_ADDR + 24], 1
+
+    pop cx
+    clc
+    ret
+
+.fail:
+    pop cx
+    stc
+    ret
 
 ; ============================================================
 ; GDT + Protected Mode
 ; ============================================================
 
+DAP:
+    db 0x10
+    db 0
+    dw KERNEL_SECTORS
+    dw KERNEL_OFFSET
+    dw 0x0000
+    dd 1
+    dd 0
+
+cur_sect: db 0
+cur_head: db 0
+cur_cyl:  db 0
+
 gdt_start:
     dd 0x0, 0x0
-
 gdt_code:
     dw 0xFFFF, 0x0
     db 0x0, 10011010b, 11001111b, 0x0
-
 gdt_data:
     dw 0xFFFF, 0x0
     db 0x0, 10010010b, 11001111b, 0x0
-
 gdt_end:
 
 gdt_descriptor:
@@ -162,11 +252,12 @@ init_pm:
 ; Data
 ; ============================================================
 
+[bits 16]
 BOOT_DRIVE:   db 0
-MSG_BOOT:     db "MyOS Bootloader", 13, 10, 0
-MSG_LOAD:     db "Loading kernel...", 0
+MSG_BOOT:     db "MyOS", 13, 10, 0
+MSG_LOAD:     db "Loading...", 0
 MSG_OK:       db " OK", 13, 10, 0
-MSG_DISK_ERR: db " DISK ERROR!", 0
+MSG_DISK_ERR: db " ERR!", 0
 
 times 510 - ($ - $$) db 0
 dw 0xAA55

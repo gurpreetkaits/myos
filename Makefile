@@ -11,7 +11,7 @@ C_SOURCES  = $(wildcard kernel/*.c)
 C_OBJECTS  = $(C_SOURCES:.c=.o)
 
 # Kernel assembly (ELF objects, not flat binary)
-ASM_KERNEL = kernel/kernel_entry.asm kernel/interrupt.asm kernel/switch.asm
+ASM_KERNEL = kernel/kernel_entry.asm kernel/interrupt.asm kernel/switch.asm kernel/gdt_flush.asm
 ASM_OBJECTS = $(ASM_KERNEL:.asm=.o)
 
 # The entry object MUST be first for the linker
@@ -71,16 +71,22 @@ $(FAT_IMAGE):
 # Run targets
 # ============================================================
 
-# Run with just the OS disk
+# Run with just the OS disk (VESA graphics mode)
 run: $(OS_IMAGE)
-	qemu-system-i386 -drive format=raw,file=$(OS_IMAGE) -monitor stdio
+	qemu-system-i386 -drive format=raw,file=$(OS_IMAGE) \
+		-device VGA -m 32 -monitor stdio
 
 # Run with OS disk + FAT16 data disk
 run-fat: $(OS_IMAGE) $(FAT_IMAGE)
 	qemu-system-i386 \
 		-drive format=raw,file=$(OS_IMAGE),index=0,if=ide \
 		-drive format=raw,file=$(FAT_IMAGE),index=1,if=ide \
-		-monitor stdio
+		-device VGA -m 32 -monitor stdio
+
+# Run in text mode (no VESA, fallback to shell)
+run-text: $(OS_IMAGE)
+	qemu-system-i386 -drive format=raw,file=$(OS_IMAGE) \
+		-device cirrus-vga -m 32 -monitor stdio
 
 # Run with no graphics (serial console)
 run-debug: $(OS_IMAGE)
@@ -92,4 +98,4 @@ clean:
 clean-all: clean
 	rm -f $(FAT_IMAGE)
 
-.PHONY: all fat run run-fat run-debug clean clean-all
+.PHONY: all fat run run-fat run-text run-debug clean clean-all

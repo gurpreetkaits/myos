@@ -2,10 +2,8 @@
 #include "io.h"
 #include "string.h"
 #include "vga.h"
-
-/* ============================================================
- * IDT structures
- * ============================================================ */
+#include "syscall.h"
+#include "process.h"
 
 struct idt_entry {
     uint16_t base_low;
@@ -23,7 +21,6 @@ struct idt_ptr {
 static struct idt_entry idt[256];
 static struct idt_ptr   idtp;
 
-/* IRQ handler table (16 IRQs: 0-15) */
 static isr_handler_t irq_handlers[16] = { 0 };
 
 static const char *exception_messages[32] = {
@@ -44,10 +41,6 @@ static const char *exception_messages[32] = {
     "Security Exception",      "Reserved"
 };
 
-/* ============================================================
- * External ISR/IRQ stubs from interrupt.asm
- * ============================================================ */
-
 extern void isr0(void);  extern void isr1(void);  extern void isr2(void);
 extern void isr3(void);  extern void isr4(void);  extern void isr5(void);
 extern void isr6(void);  extern void isr7(void);  extern void isr8(void);
@@ -67,9 +60,8 @@ extern void irq9(void);  extern void irq10(void); extern void irq11(void);
 extern void irq12(void); extern void irq13(void); extern void irq14(void);
 extern void irq15(void);
 
-/* ============================================================
- * IDT gate setup
- * ============================================================ */
+extern void isr128(void);
+extern void syscall_handler(registers_t *regs);
 
 static void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
     idt[num].base_low  = base & 0xFFFF;
@@ -78,10 +70,6 @@ static void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags
     idt[num].always0   = 0;
     idt[num].flags     = flags;
 }
-
-/* ============================================================
- * PIC remapping: IRQ 0-15 → INT 32-47
- * ============================================================ */
 
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
@@ -94,8 +82,8 @@ static void pic_remap(void) {
 
     outb(PIC1_CMD, 0x11); io_wait();
     outb(PIC2_CMD, 0x11); io_wait();
-    outb(PIC1_DATA, 0x20); io_wait();   /* IRQ 0-7  → INT 32-39 */
-    outb(PIC2_DATA, 0x28); io_wait();   /* IRQ 8-15 → INT 40-47 */
+    outb(PIC1_DATA, 0x20); io_wait();
+    outb(PIC2_DATA, 0x28); io_wait();
     outb(PIC1_DATA, 0x04); io_wait();
     outb(PIC2_DATA, 0x02); io_wait();
     outb(PIC1_DATA, 0x01); io_wait();
@@ -104,10 +92,6 @@ static void pic_remap(void) {
     outb(PIC1_DATA, mask1);
     outb(PIC2_DATA, mask2);
 }
-
-/* ============================================================
- * PIT Timer
- * ============================================================ */
 
 #define PIT_CMD  0x43
 #define PIT_CH0  0x40
@@ -120,7 +104,6 @@ static void timer_handler(registers_t *regs) {
     (void)regs;
     timer_ticks++;
 
-    /* Call scheduler if registered (after EOI was already sent) */
     if (scheduler_fn) {
         scheduler_fn();
     }
@@ -128,7 +111,7 @@ static void timer_handler(registers_t *regs) {
 
 void pit_init(uint32_t frequency) {
     uint32_t divisor = PIT_FREQ / frequency;
-    outb(PIT_CMD, 0x34);  /* Channel 0, lo/hi byte, rate generator */
+    outb(PIT_CMD, 0x34);
     outb(PIT_CH0, (uint8_t)(divisor & 0xFF));
     outb(PIT_CH0, (uint8_t)((divisor >> 8) & 0xFF));
     irq_install_handler(0, timer_handler);
@@ -142,30 +125,28 @@ void timer_set_scheduler(void (*callback)(void)) {
     scheduler_fn = callback;
 }
 
-/* ============================================================
- * Main ISR handler (called from assembly isr_common_stub)
- * ============================================================ */
-
 void isr_handler(registers_t *regs) {
-    if (regs->int_no < 32) {
-        /* CPU exception */
+    if (regs->int_no == 128) {
+        syscall_handler(regs);
+        return;
+    } else if (regs->int_no < 32) {
         terminal_print_colored("\n*** EXCEPTION: ", VGA_WHITE, VGA_RED);
         terminal_print_colored(exception_messages[regs->int_no], VGA_WHITE, VGA_RED);
         terminal_print_colored(" ***\n", VGA_WHITE, VGA_RED);
         terminal_printf("  INT=%d  ERR=0x%x  EIP=0x%x  CS=0x%x\n",
             regs->int_no, regs->err_code, regs->eip, regs->cs);
+
+        if ((regs->cs & 0x03) == 3) {
+            terminal_print_colored("  Killing user process.\n", VGA_YELLOW, VGA_BLACK);
+            process_exit();
+            return;
+        }
+
         cli();
         for (;;) hlt();
     } else if (regs->int_no >= 32 && regs->int_no < 48) {
-        /* Hardware IRQ */
         int irq = regs->int_no - 32;
 
-        /*
-         * Send EOI BEFORE calling the handler.
-         * This is critical: the timer handler may call schedule(),
-         * which context-switches and never returns to this function.
-         * Without early EOI, the PIC would never get acknowledged.
-         */
         if (irq >= 8) {
             outb(PIC2_CMD, 0x20);
         }
@@ -176,10 +157,6 @@ void isr_handler(registers_t *regs) {
         }
     }
 }
-
-/* ============================================================
- * Public API
- * ============================================================ */
 
 void irq_install_handler(int irq, isr_handler_t handler) {
     if (irq >= 0 && irq < 16) irq_handlers[irq] = handler;
@@ -196,7 +173,6 @@ void idt_init(void) {
 
     pic_remap();
 
-    /* Exceptions (INT 0-31): 0x08=kernel CS, 0x8E=present+ring0+interrupt gate */
     idt_set_gate(0,  (uint32_t)isr0,  0x08, 0x8E);
     idt_set_gate(1,  (uint32_t)isr1,  0x08, 0x8E);
     idt_set_gate(2,  (uint32_t)isr2,  0x08, 0x8E);
@@ -230,7 +206,6 @@ void idt_init(void) {
     idt_set_gate(30, (uint32_t)isr30, 0x08, 0x8E);
     idt_set_gate(31, (uint32_t)isr31, 0x08, 0x8E);
 
-    /* IRQs (INT 32-47) */
     idt_set_gate(32, (uint32_t)irq0,  0x08, 0x8E);
     idt_set_gate(33, (uint32_t)irq1,  0x08, 0x8E);
     idt_set_gate(34, (uint32_t)irq2,  0x08, 0x8E);
@@ -247,6 +222,8 @@ void idt_init(void) {
     idt_set_gate(45, (uint32_t)irq13, 0x08, 0x8E);
     idt_set_gate(46, (uint32_t)irq14, 0x08, 0x8E);
     idt_set_gate(47, (uint32_t)irq15, 0x08, 0x8E);
+
+    idt_set_gate(128, (uint32_t)isr128, 0x08, 0xEE);
 
     __asm__ volatile("lidt %0" : : "m"(idtp));
     sti();

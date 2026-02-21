@@ -96,6 +96,12 @@ IRQ 14, 46     ; Primary ATA
 IRQ 15, 47     ; Secondary ATA
 
 ; ============================================================
+; Syscall interrupt (INT 0x80)
+; ============================================================
+
+ISR_NOERRCODE 128   ; Syscall gate
+
+; ============================================================
 ; Common ISR stub
 ; Saves all registers, calls C handler, restores and irets.
 ; ============================================================
